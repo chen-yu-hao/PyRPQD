@@ -101,8 +101,8 @@ def propagate(model: Model, config: PacketConfig, active=(0,1,2)):
     system_potential = np.broadcast_to(u, shape).copy()
     for a, j in enumerate(active[1:], start=1):
         system_potential += 0.5*k[..., j-1]*(mesh[a]-c[..., j-1])**2
-    k = [np.broadcast_to(k[..., j-1], shape) for j in bath]
-    c = [np.broadcast_to(c[..., j-1], shape) for j in bath]
+    k = [k[..., j-1].reshape(len(axes[0])) for j in bath]
+    c = [c[..., j-1].reshape(len(axes[0])) for j in bath]
     kinetic = np.zeros(shape)
     for a, j in enumerate(active):
         p = 2*np.pi*fftfreq(len(axes[a]), axes[a][1]-axes[a][0])
@@ -112,22 +112,29 @@ def propagate(model: Model, config: PacketConfig, active=(0,1,2)):
     steps = int(np.ceil(config.time/config.dt))
     dt = config.time/steps
     kinetic_phase = np.exp(-1j*dt*kinetic)
-    broadcast = (-1,)+(1,)*ndim
+    broadcast = (count, len(axes[0]))+(1,)*(ndim-1)
     bath_mass = np.asarray(model.masses)[list(bath)]
 
-    def effective_potential(qb):
-        out = np.broadcast_to(system_potential, (count,)+shape).copy()
+    def bath_potential(qb):
+        # Every bath term depends on the quantum x coordinate only. Keep the
+        # bath phase one-dimensional instead of exponentiating a full batch
+        # of 2D potentials at every half-step.
+        out = np.zeros((count, len(axes[0])))
         for a in range(len(bath)):
-            mean = qb[..., a].mean(axis=1).reshape(broadcast)
-            square = (qb[..., a]**2).mean(axis=1).reshape(broadcast)
+            mean = qb[..., a].mean(axis=1)[:, None]
+            square = (qb[..., a]**2).mean(axis=1)[:, None]
             out += 0.5*k[a]*(square-2*c[a]*mean+c[a]**2)
         return out
 
+    def effective_potential(qb):
+        return system_potential + bath_potential(qb).reshape(broadcast)
+
     def force(density, qb):
         out = np.empty_like(qb)
+        marginal = density.sum(axis=tuple(range(2, ndim+1))) if ndim > 1 else density
         for a in range(len(bath)):
-            expected_k = np.sum(density*k[a], axis=sum_axes)
-            expected_kc = np.sum(density*k[a]*c[a], axis=sum_axes)
+            expected_k = marginal@k[a]
+            expected_kc = marginal@(k[a]*c[a])
             out[..., a] = -expected_k[:, None]*qb[..., a]+expected_kc[:, None]
         return out
 
@@ -140,7 +147,7 @@ def propagate(model: Model, config: PacketConfig, active=(0,1,2)):
         return en
 
     initial_energy = energy()
-    static_phase = np.exp(-0.5j*dt*effective_potential(q)) if not bath else None
+    static_phase = np.exp(-0.5j*dt*system_potential)
     saves = set(np.unique(np.linspace(0, steps, 41).astype(int)))
     rows, final_per_sample = [], None
     max_edge = 0.0
@@ -165,16 +172,16 @@ def propagate(model: Model, config: PacketConfig, active=(0,1,2)):
         if step == steps:
             break
         if bath:
-            potential = effective_potential(q)
             v += 0.5*dt*force(abs(psi)**2, q)/bath_mass
-        psi *= static_phase if not bath else np.exp(-0.5j*dt*potential)
+            psi *= np.exp(-0.5j*dt*bath_potential(q)).reshape(broadcast)
+        psi *= static_phase
         psi = ifftn(fftn(psi, axes=sum_axes, norm="ortho")*kinetic_phase,
                     axes=sum_axes, norm="ortho")
         if bath:
             q, v = free_ring_step(q, v, dt, config.beta)
         if bath:
-            potential = effective_potential(q)
-        psi *= static_phase if not bath else np.exp(-0.5j*dt*potential)
+            psi *= np.exp(-0.5j*dt*bath_potential(q)).reshape(broadcast)
+        psi *= static_phase
         if bath:
             v += 0.5*dt*force(abs(psi)**2, q)/bath_mass
     drift = float(np.max(abs(energy()-initial_energy)/(1+abs(initial_energy))))

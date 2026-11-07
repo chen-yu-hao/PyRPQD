@@ -150,9 +150,12 @@ def run_thermal(output, kinds, quick=False, samples=None, betas=(2.,4.)):
     return data
 
 
-def run_packets(output,kinds,quick=False,samples=None):
+def run_packets(output,kinds,quick=False,samples=None,resume=False):
     output = Path(output)
-    data = {"metadata":metadata(),"models":{}}
+    checkpoint = output/"packets.json"
+    data = json.loads(checkpoint.read_text()) if resume and checkpoint.exists() else {"metadata":metadata(),"models":{}}
+    if resume:
+        data.setdefault("resume_history",[]).append(metadata())
     for kind in kinds:
         cfg = PacketConfig(energy={"resonance":1.64,"tunneling":2.,"zpe":.65}[kind],
                            x0=-24.,sigma=4.,x_extent=200. if kind == "resonance" else 112.,
@@ -163,10 +166,18 @@ def run_packets(output,kinds,quick=False,samples=None):
                            thermal_levels=1,seed=20261107)
         item = {"parameters":asdict(model_for(kind)),"methods":{},
                 "initial_state_note":"QD retains ground bath state; omitted thermal weight is reported and bounds thermal-truncation error for bounded observables"}
+        if resume and kind in data["models"]:
+            item = data["models"][kind]
         for label,active in {"QD3D":(0,1,2),"B1+2":(0,),"B2+1_xy":(0,1),"B2+1_xz":(0,2)}.items():
+            if label in item["methods"]:
+                if item["methods"][label]["config"] != asdict(cfg):
+                    raise ValueError("Resume settings do not match checkpoint")
+                print(f"reuse packet {kind} {label}",flush=True)
+                continue
             start = time.perf_counter()
             result = propagate(model_for(kind),cfg,active)
             result["seconds"] = time.perf_counter()-start
+            result["source_sha256"] = metadata()["source_sha256"]
             item["methods"][label] = result
             print(f"packet {kind} {label}: {result['product_probability']:.7g} +/- {result['stderr']:.2g}; {result['warnings']}",flush=True)
             data["models"][kind] = item
@@ -181,12 +192,15 @@ def main():
     parser.add_argument("--output",default="results/local")
     parser.add_argument("--quick",action="store_true",help="Smoke settings; not converged scientific results")
     parser.add_argument("--samples",type=int)
+    parser.add_argument("--resume",action="store_true",help="Resume matching packet checkpoints")
     parser.add_argument("--betas",type=float,nargs="+",default=[2.,4.])
     args = parser.parse_args()
+    if args.resume and args.mode != "packet":
+        parser.error("--resume currently applies only to --mode packet")
     if args.mode in {"thermal","all"}:
         run_thermal(args.output,args.models,args.quick,args.samples,tuple(args.betas))
     if args.mode in {"packet","all"}:
-        run_packets(args.output,args.models,args.quick,args.samples)
+        run_packets(args.output,args.models,args.quick,args.samples,args.resume)
 
 
 if __name__ == "__main__":
